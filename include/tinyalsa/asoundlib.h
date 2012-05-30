@@ -101,6 +101,10 @@ enum mixer_ctl_type {
 };
 
 /* Open and close a stream */
+struct pcm *pcm_open_req(unsigned int card, unsigned int device,
+                     unsigned int flags, struct pcm_config *config, int requested_rate);
+
+/* Open and close a stream */
 struct pcm *pcm_open(unsigned int card, unsigned int device,
                      unsigned int flags, struct pcm_config *config);
 int pcm_close(struct pcm *pcm);

@@ -25,6 +25,9 @@
 ** OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
 ** DAMAGE.
 */
+#define LOG_TAG "alsa_pcm"
+// #define LOG_NDEBUG 0
+#include <cutils/log.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,6 +124,69 @@ static unsigned int param_get_int(struct snd_pcm_hw_params *p, int n)
     return 0;
 }
 
+#define DEBUG 0
+#if DEBUG
+static const char *param_name[PARAM_MAX+1] = {
+    [SNDRV_PCM_HW_PARAM_ACCESS] = "access",
+    [SNDRV_PCM_HW_PARAM_FORMAT] = "format",
+    [SNDRV_PCM_HW_PARAM_SUBFORMAT] = "subformat",
+
+    [SNDRV_PCM_HW_PARAM_SAMPLE_BITS] = "sample_bits",
+    [SNDRV_PCM_HW_PARAM_FRAME_BITS] = "frame_bits",
+    [SNDRV_PCM_HW_PARAM_CHANNELS] = "channels",
+    [SNDRV_PCM_HW_PARAM_RATE] = "rate",
+    [SNDRV_PCM_HW_PARAM_PERIOD_TIME] = "period_time",
+    [SNDRV_PCM_HW_PARAM_PERIOD_SIZE] = "period_size",
+    [SNDRV_PCM_HW_PARAM_PERIOD_BYTES] = "period_bytes",
+    [SNDRV_PCM_HW_PARAM_PERIODS] = "periods",
+    [SNDRV_PCM_HW_PARAM_BUFFER_TIME] = "buffer_time",
+    [SNDRV_PCM_HW_PARAM_BUFFER_SIZE] = "buffer_size",
+    [SNDRV_PCM_HW_PARAM_BUFFER_BYTES] = "buffer_bytes",
+    [SNDRV_PCM_HW_PARAM_TICK_TIME] = "tick_time",
+};
+
+static void param_dump(struct snd_pcm_hw_params *p)
+{
+    int n;
+
+    for (n = SNDRV_PCM_HW_PARAM_FIRST_MASK;
+         n <= SNDRV_PCM_HW_PARAM_LAST_MASK; n++) {
+            struct snd_mask *m = param_to_mask(p, n);
+            LOGV("%s = %08x%08x\n", param_name[n],
+                   m->bits[1], m->bits[0]);
+    }
+    for (n = SNDRV_PCM_HW_PARAM_FIRST_INTERVAL;
+         n <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL; n++) {
+            struct snd_interval *i = param_to_interval(p, n);
+            LOGV("%s = (%d,%d) omin=%d omax=%d int=%d empty=%d\n",
+                   param_name[n], i->min, i->max, i->openmin,
+                   i->openmax, i->integer, i->empty);
+    }
+    LOGV("info = %08x\n", p->info);
+    LOGV("msbits = %d\n", p->msbits);
+    LOGV("rate = %d/%d\n", p->rate_num, p->rate_den);
+    LOGV("fifo = %d\n", (int) p->fifo_size);
+}
+
+static void info_dump(struct snd_pcm_info *info)
+{
+    LOGV("device = %d\n", info->device);
+    LOGV("subdevice = %d\n", info->subdevice);
+    LOGV("stream = %d\n", info->stream);
+    LOGV("card = %d\n", info->card);
+    LOGV("id = '%s'\n", info->id);
+    LOGV("name = '%s'\n", info->name);
+    LOGV("subname = '%s'\n", info->subname);
+    LOGV("dev_class = %d\n", info->dev_class);
+    LOGV("dev_subclass = %d\n", info->dev_subclass);
+    LOGV("subdevices_count = %d\n", info->subdevices_count);
+    LOGV("subdevices_avail = %d\n", info->subdevices_avail);
+}
+#else
+static void param_dump(struct snd_pcm_hw_params *p) {}
+static void info_dump(struct snd_pcm_info *info) {}
+#endif
+
 static void param_init(struct snd_pcm_hw_params *p)
 {
     int n;
@@ -157,6 +223,10 @@ struct pcm {
     void *mmap_buffer;
     unsigned int noirq_frames_per_msec;
     int wait_for_avail_min;
+	
+	// star add
+	int capture_channels;
+	short * p_capture_buf;
 };
 
 unsigned int pcm_get_buffer_size(struct pcm *pcm)
@@ -405,7 +475,7 @@ int pcm_read(struct pcm *pcm, void *data, unsigned int count)
     if (!(pcm->flags & PCM_IN))
         return -EINVAL;
 
-    x.buf = data;
+    x.buf = (void *)pcm->p_capture_buf;
     x.frames = count / (pcm->config.channels *
                         pcm_format_to_bits(pcm->config.format) / 8);
 
@@ -426,8 +496,21 @@ int pcm_read(struct pcm *pcm, void *data, unsigned int count)
             }
             return oops(pcm, errno, "cannot read stream data");
         }
-        return 0;
+        break;
     }
+
+	if (pcm->capture_channels == 1)
+	{
+		short * p_out_data = data;
+		int offset = 0, cnt = 0;
+		for (cnt = 0; cnt < x.frames; cnt++)
+		{
+			offset = cnt << 1;		// short
+			*(p_out_data + cnt) =  (*(pcm->p_capture_buf + offset) >> 1) + (*(pcm->p_capture_buf + offset + 1) >> 1);
+		}
+	}
+
+	return 0;
 }
 
 static struct pcm bad_pcm = {
@@ -451,12 +534,30 @@ int pcm_close(struct pcm *pcm)
     pcm->running = 0;
     pcm->buffer_size = 0;
     pcm->fd = -1;
+
+	if (pcm->p_capture_buf != 0)
+	{
+		free(pcm->p_capture_buf);
+		pcm->p_capture_buf = 0;
+	}
     free(pcm);
     return 0;
 }
 
-struct pcm *pcm_open(unsigned int card, unsigned int device,
-                     unsigned int flags, struct pcm_config *config)
+static int pcm_rate[] = {8000,
+						11025,
+						12000,
+						16000,
+						22050,
+						24000,
+						32000,
+						44100,
+						48000};
+
+static int size_rate = sizeof(pcm_rate) / sizeof(pcm_rate[0]);
+
+struct pcm *pcm_open_req(unsigned int card, unsigned int device,
+                     unsigned int flags, struct pcm_config *config, int requested_rate)
 {
     struct pcm *pcm;
     struct snd_pcm_info info;
@@ -464,6 +565,10 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
     struct snd_pcm_sw_params sparams;
     char fn[256];
     int rc;
+	int index = 0, cnt = 0;
+	int ret = -1;
+
+	LOGV("pcm_open_req, card: %d, device: %d, req_rate: %d", card, device, requested_rate);
 
     pcm = calloc(1, sizeof(struct pcm));
     if (!pcm || !config)
@@ -473,6 +578,21 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
 
     snprintf(fn, sizeof(fn), "/dev/snd/pcmC%uD%u%c", card, device,
              flags & PCM_IN ? 'c' : 'p');
+
+	if ((flags & PCM_IN) && (config->channels == 1))
+	{
+		pcm->capture_channels = 1;	// flag: we need mono audio stream
+		config->channels = 2;		// set hw params stereo(2 channels)
+
+		LOGV("force capture stereo audio");
+
+		pcm->p_capture_buf = (short*)calloc(1, 1024 * 8);
+		if (pcm->p_capture_buf == 0)
+		{
+			LOGE("calloc capture buffer failed");
+			goto fail_close;
+		}
+	}
 
     pcm->flags = flags;
     pcm->fd = open(fn, O_RDWR);
@@ -485,45 +605,86 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
         oops(pcm, errno, "cannot get info");
         goto fail_close;
     }
+    info_dump(&info);
+	
+	for (index = 0; index < size_rate; index++)
+	{
+		if (pcm_rate[index] == requested_rate)
+		{
+			break;
+		}
+	}
 
-    param_init(&params);
-    param_set_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT,
-                   pcm_format_to_alsa(config->format));
-    param_set_mask(&params, SNDRV_PCM_HW_PARAM_SUBFORMAT,
-                   SNDRV_PCM_SUBFORMAT_STD);
-    param_set_min(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, config->period_size);
-    param_set_int(&params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS,
-                  pcm_format_to_bits(config->format));
-    param_set_int(&params, SNDRV_PCM_HW_PARAM_FRAME_BITS,
-                  pcm_format_to_bits(config->format) * config->channels);
-    param_set_int(&params, SNDRV_PCM_HW_PARAM_CHANNELS,
-                  config->channels);
-    param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIODS, config->period_count);
-    param_set_int(&params, SNDRV_PCM_HW_PARAM_RATE, config->rate);
+	if (index == size_rate)
+	{
+		if (requested_rate < pcm_rate[0])
+		{
+			config->rate = pcm_rate[0];
+		}
+		else
+		{
+			config->rate = pcm_rate[index - 1];
+		}
+	}
 
-    if (flags & PCM_NOIRQ) {
+    for (cnt = 0; cnt < size_rate; cnt++)
+	{
+		config->rate = pcm_rate[(index + cnt) % size_rate];
+		LOGV("pcm_open_req try rate: %d", config->rate);
 
-        if (!(flags & PCM_MMAP)) {
-            oops(pcm, -EINVAL, "noirq only currently supported with mmap().");
-            goto fail;
-        }
+		param_init(&params);
+	    param_set_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT,
+	                   pcm_format_to_alsa(config->format));
+	    param_set_mask(&params, SNDRV_PCM_HW_PARAM_SUBFORMAT,
+	                   SNDRV_PCM_SUBFORMAT_STD);
+	    param_set_min(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, config->period_size);
+	    param_set_int(&params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS,
+	                  pcm_format_to_bits(config->format));
+	    param_set_int(&params, SNDRV_PCM_HW_PARAM_FRAME_BITS,
+	                  pcm_format_to_bits(config->format) * config->channels);
+	    param_set_int(&params, SNDRV_PCM_HW_PARAM_CHANNELS,
+	                  config->channels);
+	    param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIODS, config->period_count);
+	    param_set_int(&params, SNDRV_PCM_HW_PARAM_RATE, config->rate);
+    	    
+		param_dump(&params);
+		
+	    if (flags & PCM_NOIRQ) {
 
-        params.flags |= SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP;
-        pcm->noirq_frames_per_msec = config->rate / 1000;
+	        if (!(flags & PCM_MMAP)) {
+	            oops(pcm, -EINVAL, "noirq only currently supported with mmap().");
+	            goto fail;
+	        }
+
+	        params.flags |= SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP;
+	        pcm->noirq_frames_per_msec = config->rate / 1000;
+	    }
+
+	    if (flags & PCM_MMAP)
+	        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
+	                   SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
+	    else
+	        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
+	                   SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+
+	    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params)) {
+	        LOGV("cannot set hw params");
+	    }
+		else
+		{
+	    	LOGV("pcm_open_req OK config->rate: %d", config->rate);
+			break;
+		}
     }
 
-    if (flags & PCM_MMAP)
-        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
-                   SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
-    else
-        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
-                   SNDRV_PCM_ACCESS_RW_INTERLEAVED);
-
-    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params)) {
-        oops(pcm, errno, "cannot set hw params");
+	if (cnt == size_rate)
+	{
+		oops(pcm, errno, "pcm_open_req cannot set hw params");
         goto fail_close;
-    }
+	}
 
+	param_dump(&params);
+	
     /* get our refined hw_params */
     config->period_size = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
     config->period_count = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIODS);
@@ -551,9 +712,168 @@ struct pcm *pcm_open(unsigned int card, unsigned int device,
         sparams.start_threshold = config->start_threshold;
 
     /* pick a high stop threshold - todo: does this need further tuning */
-    if (!config->stop_threshold)
-        pcm->config.stop_threshold = sparams.stop_threshold =
-            config->period_count * config->period_size;
+    if (!config->stop_threshold) {
+        if (pcm->flags & PCM_IN)
+            pcm->config.stop_threshold = sparams.stop_threshold =
+                config->period_count * config->period_size * 10;
+        else
+            pcm->config.stop_threshold = sparams.stop_threshold =
+                config->period_count * config->period_size;
+    }
+    else
+        sparams.stop_threshold = config->stop_threshold;
+
+    if (!pcm->config.avail_min) {
+        if (pcm->flags & PCM_MMAP)
+            pcm->config.avail_min = sparams.avail_min = pcm->config.period_size;
+        else
+            pcm->config.avail_min = sparams.avail_min = 1;
+    } else
+        sparams.avail_min = config->avail_min;
+
+    sparams.xfer_align = config->period_size / 2; /* needed for old kernels */
+    sparams.silence_size = 0;
+    sparams.silence_threshold = config->silence_threshold;
+    pcm->boundary = sparams.boundary = pcm->buffer_size;
+
+    while (pcm->boundary * 2 <= LONG_MAX - pcm->buffer_size)
+		pcm->boundary *= 2;
+
+    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_SW_PARAMS, &sparams)) {
+        oops(pcm, errno, "cannot set sw params");
+        goto fail;
+    }
+
+    rc = pcm_hw_mmap_status(pcm);
+    if (rc < 0) {
+        oops(pcm, rc, "mmap status failed");
+        goto fail;
+    }
+
+    pcm->underruns = 0;
+    return pcm;
+
+fail:
+    if (flags & PCM_MMAP)
+        munmap(pcm->mmap_buffer, pcm_frames_to_bytes(pcm, pcm->buffer_size));
+fail_close:
+    close(pcm->fd);
+    pcm->fd = -1;
+    return pcm;
+}
+
+struct pcm *pcm_open(unsigned int card, unsigned int device,
+                     unsigned int flags, struct pcm_config *config)
+{
+    struct pcm *pcm;
+    struct snd_pcm_info info;
+    struct snd_pcm_hw_params params;
+    struct snd_pcm_sw_params sparams;
+    char fn[256];
+    int rc;
+
+	LOGD("pcm_open, card: %d, device: %d, req_rate: %d", card, device);
+
+    pcm = calloc(1, sizeof(struct pcm));
+    if (!pcm || !config)
+        return &bad_pcm; /* TODO: could support default config here */
+
+    pcm->config = *config;
+
+    snprintf(fn, sizeof(fn), "/dev/snd/pcmC%uD%u%c", card, device,
+             flags & PCM_IN ? 'c' : 'p');
+
+    pcm->flags = flags;
+    pcm->fd = open(fn, O_RDWR);
+    if (pcm->fd < 0) {
+        oops(pcm, errno, "cannot open device '%s'", fn);
+        return pcm;
+    }
+
+    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_INFO, &info)) {
+        oops(pcm, errno, "cannot get info");
+        goto fail_close;
+    }
+    info_dump(&info);
+
+    param_init(&params);
+    param_set_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT,
+                   pcm_format_to_alsa(config->format));
+    param_set_mask(&params, SNDRV_PCM_HW_PARAM_SUBFORMAT,
+                   SNDRV_PCM_SUBFORMAT_STD);
+    param_set_min(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, config->period_size);
+    param_set_int(&params, SNDRV_PCM_HW_PARAM_SAMPLE_BITS,
+                  pcm_format_to_bits(config->format));
+    param_set_int(&params, SNDRV_PCM_HW_PARAM_FRAME_BITS,
+                  pcm_format_to_bits(config->format) * config->channels);
+    param_set_int(&params, SNDRV_PCM_HW_PARAM_CHANNELS,
+                  config->channels);
+    param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIODS, config->period_count);
+    param_set_int(&params, SNDRV_PCM_HW_PARAM_RATE, config->rate);
+    
+    
+	param_dump(&params);
+	
+    if (flags & PCM_NOIRQ) {
+
+        if (!(flags & PCM_MMAP)) {
+            oops(pcm, -EINVAL, "noirq only currently supported with mmap().");
+            goto fail;
+        }
+
+        params.flags |= SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP;
+        pcm->noirq_frames_per_msec = config->rate / 1000;
+    }
+
+    if (flags & PCM_MMAP)
+        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
+                   SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
+    else
+        param_set_mask(&params, SNDRV_PCM_HW_PARAM_ACCESS,
+                   SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+
+    if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_HW_PARAMS, &params)) {
+        oops(pcm, errno, "cannot set hw params");
+        goto fail_close;
+    }
+
+	param_dump(&params);
+	
+    /* get our refined hw_params */
+    config->period_size = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
+    config->period_count = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIODS);
+    pcm->buffer_size = config->period_count * config->period_size;
+
+    if (flags & PCM_MMAP) {
+        pcm->mmap_buffer = mmap(NULL, pcm_frames_to_bytes(pcm, pcm->buffer_size),
+                                PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, pcm->fd, 0);
+        if (pcm->mmap_buffer == MAP_FAILED) {
+            oops(pcm, -errno, "failed to mmap buffer %d bytes\n",
+                 pcm_frames_to_bytes(pcm, pcm->buffer_size));
+            goto fail_close;
+        }
+    }
+
+
+    memset(&sparams, 0, sizeof(sparams));
+    sparams.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
+    sparams.period_step = 1;
+
+    if (!config->start_threshold)
+        pcm->config.start_threshold = sparams.start_threshold =
+            config->period_count * config->period_size / 2;
+    else
+        sparams.start_threshold = config->start_threshold;
+
+    /* pick a high stop threshold - todo: does this need further tuning */
+    if (!config->stop_threshold) {
+        if (pcm->flags & PCM_IN)
+            pcm->config.stop_threshold = sparams.stop_threshold =
+                config->period_count * config->period_size * 10;
+        else
+            pcm->config.stop_threshold = sparams.stop_threshold =
+                config->period_count * config->period_size;
+    }
     else
         sparams.stop_threshold = config->stop_threshold;
 

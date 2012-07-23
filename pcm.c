@@ -476,13 +476,14 @@ int pcm_read(struct pcm *pcm, void *data, unsigned int count)
         return -EINVAL;
 
     x.buf = (void *)pcm->p_capture_buf;
-    x.frames = count / (pcm->config.channels *
+    x.frames = count / (pcm->capture_channels *
                         pcm_format_to_bits(pcm->config.format) / 8);
 
     for (;;) {
         if (!pcm->running) {
             if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_PREPARE))
                 return oops(pcm, errno, "cannot prepare channel");
+            	
             if (ioctl(pcm->fd, SNDRV_PCM_IOCTL_START))
                 return oops(pcm, errno, "cannot start channel");
             pcm->running = 1;
@@ -508,6 +509,10 @@ int pcm_read(struct pcm *pcm, void *data, unsigned int count)
 			offset = cnt << 1;		// short
 			*(p_out_data + cnt) =  (*(pcm->p_capture_buf + offset) >> 1) + (*(pcm->p_capture_buf + offset + 1) >> 1);
 		}
+	}
+	else
+	{
+		data = (void *)pcm->p_capture_buf;
 	}
 
 	return 0;
@@ -579,13 +584,15 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
     snprintf(fn, sizeof(fn), "/dev/snd/pcmC%uD%u%c", card, device,
              flags & PCM_IN ? 'c' : 'p');
 
-	if ((flags & PCM_IN) && (config->channels == 1))
+	pcm->capture_channels = config->in_init_channels ;
+	if ((flags & PCM_IN) && (config->in_init_channels == 1))
 	{
-		pcm->capture_channels = 1;	// flag: we need mono audio stream
 		config->channels = 2;		// set hw params stereo(2 channels)
-
-		LOGV("force capture stereo audio");
-
+		LOGV("force capture stereo audio");			
+	}
+		
+	if ((flags & PCM_IN))
+	{
 		pcm->p_capture_buf = (short*)calloc(1, 1024 * 8);
 		if (pcm->p_capture_buf == 0)
 		{
@@ -593,7 +600,7 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
 			goto fail_close;
 		}
 	}
-
+	
     pcm->flags = flags;
     pcm->fd = open(fn, O_RDWR);
     if (pcm->fd < 0) {
@@ -646,7 +653,7 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
 	                  config->channels);
 	    param_set_int(&params, SNDRV_PCM_HW_PARAM_PERIODS, config->period_count);
 	    param_set_int(&params, SNDRV_PCM_HW_PARAM_RATE, config->rate);
-    	    
+    	
 		param_dump(&params);
 		
 	    if (flags & PCM_NOIRQ) {
@@ -684,7 +691,7 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
 	}
 
 	param_dump(&params);
-	
+
     /* get our refined hw_params */
     config->period_size = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
     config->period_count = param_get_int(&params, SNDRV_PCM_HW_PARAM_PERIODS);
@@ -699,7 +706,6 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
             goto fail_close;
         }
     }
-
 
     memset(&sparams, 0, sizeof(sparams));
     sparams.tstamp_mode = SNDRV_PCM_TSTAMP_ENABLE;
@@ -749,7 +755,7 @@ struct pcm *pcm_open_req(unsigned int card, unsigned int device,
         oops(pcm, rc, "mmap status failed");
         goto fail;
     }
-
+	
     pcm->underruns = 0;
     return pcm;
 

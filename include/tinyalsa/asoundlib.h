@@ -85,6 +85,8 @@ struct pcm_config {
     unsigned int stop_threshold;
     unsigned int silence_threshold;
     int avail_min;
+	
+	unsigned int in_init_channels;//keep the record init channels
 };
 
 /* Mixer control types */
